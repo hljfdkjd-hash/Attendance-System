@@ -9,19 +9,36 @@ from flask import (Flask, render_template, request, redirect, url_for,
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import (LoginManager, login_user, login_required,
                          logout_user, current_user, UserMixin)
+
 from werkzeug.security import generate_password_hash, check_password_hash
 from PIL import Image
 import numpy as np
 import face_recognition
+import cv2
+from scipy.spatial import distance as dist
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'replace-with-a-secure-random-key'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///attendance.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+# uploads folder
+app.config['UPLOAD_FOLDER'] = 'uploads'
+os.makedirs('uploads', exist_ok=True)
+
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
+
+
+# ========= EYE ASPECT RATIO (EAR) =========
+def calculate_ear(eye):
+    A = dist.euclidean(eye[1], eye[5])
+    B = dist.euclidean(eye[2], eye[4])
+    C = dist.euclidean(eye[0], eye[3])
+    ear = (A + B) / (2.0 * C)
+    return ear
+
 
 # ----------------- MODELS -----------------
 class Faculty(UserMixin, db.Model):
@@ -45,8 +62,9 @@ class Student(db.Model):
     roll = db.Column(db.String(100), unique=True, nullable=False)
     branch = db.Column(db.String(100), nullable=False)
     year = db.Column(db.String(20), nullable=False)
-    # store face encoding as pickled blob
-    face_encoding = db.Column(db.LargeBinary, nullable=False)  # pickled numpy array
+
+    image_path = db.Column(db.String(300))  # stored image path
+    face_encoding = db.Column(db.LargeBinary, nullable=False)
     added_on = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -69,12 +87,12 @@ def load_user(user_id):
     return Faculty.query.get(int(user_id))
 
 
-# ----------------- ROUTES -----------------
 @app.route('/')
 def index():
     return redirect(url_for('login'))
 
 
+# REGISTER
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
@@ -96,6 +114,7 @@ def register():
     return render_template('register.html')
 
 
+# LOGIN
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -116,28 +135,18 @@ def logout():
     logout_user()
     return redirect(url_for('login'))
 
-from datetime import date
 
+# DASHBOARD
 @app.route("/dashboard")
 @login_required
 def dashboard():
     today = date.today()
-
-    # 1. Get all branches and years
     classes = db.session.query(Student.branch, Student.year).distinct().all()
 
     summary = []
-
     for branch, year in classes:
-        # Total students in class
         total_students = Student.query.filter_by(branch=branch, year=year).count()
-
-        # Total present today
-        present_count = Attendance.query.filter_by(
-            date=today, branch=branch, year=year
-        ).count()
-
-        # Absent = total - present
+        present_count = Attendance.query.filter_by(date=today, branch=branch, year=year).count()
         absent_count = total_students - present_count
 
         summary.append({
@@ -150,130 +159,143 @@ def dashboard():
     return render_template("dashboard.html", summary=summary, today=today)
 
 
-
-# ------------- ADD STUDENT -------------
+# ADD STUDENT
 @app.route('/add-student', methods=['GET', 'POST'])
 @login_required
 def add_student():
-    branches = ['CSE', 'IT', 'ME', 'CE', 'ECE', 'EE']  # you can customize
+    branches = ['CSE', 'IT', 'ME', 'CE', 'ECE', 'EE']
     years = ['1st', '2nd', '3rd', '4th']
+
     if request.method == 'POST':
-        name = request.form['name'].strip()
-        roll = request.form['roll'].strip()
+        name = request.form['name']
+        roll = request.form['roll']
         branch = request.form['branch']
         year = request.form['year']
         file = request.files.get('image')
 
         if not (name and roll and branch and year and file):
-            flash('All fields are required', 'danger')
+            flash('All fields required', 'danger')
             return redirect(url_for('add_student'))
 
-        # read uploaded image and compute face encoding
-        img_stream = file.read()
-        pil_img = Image.open(io.BytesIO(img_stream)).convert('RGB')
-        np_img = np.array(pil_img)
-        boxes = face_recognition.face_locations(np_img)
+        # save image
+        img = Image.open(file.stream).convert("RGB")
+        filename = f"{roll}_{int(datetime.utcnow().timestamp())}.jpg"
+        filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        img.save(filepath)
 
-        if len(boxes) == 0:
-            flash('No face detected in the uploaded image. Please upload a clear face image.', 'danger')
-            return redirect(url_for('add_student'))
-        # compute encoding (use first face)
-        encs = face_recognition.face_encodings(np_img, boxes)
-        encoding = encs[0]
+        # encoding
+        np_img = np.array(img)
+        faces = face_recognition.face_locations(np_img)
+        if len(faces) == 0:
+            flash("No face detected", "danger")
+            return redirect(url_for("add_student"))
 
-        # pickle the numpy array
-        pickled = pickle.dumps(encoding)
+        enc = face_recognition.face_encodings(np_img, faces)[0]
+        pickled = pickle.dumps(enc)
 
-        # create student
         if Student.query.filter_by(roll=roll).first():
-            flash('Student with this roll already exists', 'danger')
+            flash('Roll already exists', 'danger')
             return redirect(url_for('add_student'))
 
-        student = Student(name=name, roll=roll, branch=branch, year=year, face_encoding=pickled)
+        student = Student(
+            name=name,
+            roll=roll,
+            branch=branch,
+            year=year,
+            image_path=filepath,
+            face_encoding=pickled
+        )
         db.session.add(student)
         db.session.commit()
-        flash('Student added successfully', 'success')
+
+        flash("Student added successfully", "success")
         return redirect(url_for('dashboard'))
 
     return render_template('add_student.html', branches=branches, years=years)
 
 
-# ------------- MARK ATTENDANCE PAGE (frontend) -------------
+# MARK ATTENDANCE PAGE
 @app.route('/mark-attendance')
 @login_required
 def mark_attendance():
     return render_template('mark_attendance.html')
 
 
-# ------------- RECOGNITION ENDPOINT -------------
+# ================= FACE RECOGNITION + BLINK DETECTION =================
 @app.route('/recognize', methods=['POST'])
 @login_required
 def recognize():
-    """
-    Expects JSON: {"image": "data:image/jpeg;base64,...."}
-    Returns JSON with recognized student info (if any) and whether attendance was marked.
-    """
     data = request.json
-    img_b64 = data.get('image', '')
-    if not img_b64:
-        return jsonify({"status": "error", "message": "No image provided"}), 400
+    img_b64 = data.get('image', '').split(',')[-1]
 
-    # strip header if present
-    if ',' in img_b64:
-        img_b64 = img_b64.split(',', 1)[1]
+    if not img_b64:
+        return jsonify({"status": "error", "message": "No image"}), 400
 
     try:
         img_bytes = base64.b64decode(img_b64)
         pil_img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
         np_img = np.array(pil_img)
-    except Exception as e:
-        return jsonify({"status": "error", "message": "Invalid image data"}), 400
+    except:
+        return jsonify({"status": "error", "message": "Invalid image"}), 400
 
-    # find face locations & encodings in frame
     face_locations = face_recognition.face_locations(np_img)
     if len(face_locations) == 0:
-        return jsonify({"status": "ok", "found": False})  # no face in this frame
+        return jsonify({"status": "ok", "found": False})
 
+    # ---------- BLINK DETECTION ----------
+    landmarks = face_recognition.face_landmarks(np_img)
+    if not landmarks:
+        return jsonify({"status": "ok", "found": False})
+
+    left_eye = landmarks[0]["left_eye"]
+    right_eye = landmarks[0]["right_eye"]
+
+    left_ear = calculate_ear(left_eye)
+    right_ear = calculate_ear(right_eye)
+    ear = (left_ear + right_ear) / 2.0
+
+    BLINK_THRESHOLD = 0.22
+
+    if ear > BLINK_THRESHOLD:
+        return jsonify({
+            "status": "error",
+            "message": "Blink not detected — Please blink to verify you are real!"
+        })
+
+    # ---------- FACE MATCH ----------
     encodings = face_recognition.face_encodings(np_img, face_locations)
-
-    # load all students' encodings
     students = Student.query.all()
-    known_encodings = []
-    student_map = []  # parallel list of Student
+
+    known = []
+    st_map = []
+
     for s in students:
         try:
-            enc = pickle.loads(s.face_encoding)
-        except Exception:
-            continue
-        known_encodings.append(enc)
-        student_map.append(s)
+            known.append(pickle.loads(s.face_encoding))
+            st_map.append(s)
+        except:
+            pass
 
-    # For each detected face in the frame, try to match
     results = []
     for enc in encodings:
-        if len(known_encodings) == 0:
-            continue
-        distances = face_recognition.face_distance(known_encodings, enc)
+        distances = face_recognition.face_distance(known, enc)
         best_idx = int(np.argmin(distances))
-        best_distance = float(distances[best_idx])
-        # threshold: 0.5 is typical; tune for your environment. Lower -> stricter
+        best_distance = distances[best_idx]
+
         if best_distance <= 0.5:
-            matched = student_map[best_idx]
-            # check if attendance already marked today
+            matched = st_map[best_idx]
             today = date.today()
+
             existing = Attendance.query.filter_by(roll=matched.roll, date=today).first()
             if existing:
                 results.append({
                     "student_id": matched.id,
                     "name": matched.name,
                     "roll": matched.roll,
-                    "branch": matched.branch,
-                    "year": matched.year,
                     "marked": False,
                     "reason": "already_marked"
                 })
             else:
-                # mark attendance
                 now_time = datetime.now().strftime("%H:%M:%S")
                 att = Attendance(
                     student_id=matched.id,
@@ -286,25 +308,27 @@ def recognize():
                 )
                 db.session.add(att)
                 db.session.commit()
+
                 results.append({
                     "student_id": matched.id,
                     "name": matched.name,
                     "roll": matched.roll,
-                    "branch": matched.branch,
-                    "year": matched.year,
                     "marked": True
                 })
+
         else:
-            # no match
-            results.append({"matched": False, "distance": best_distance})
+            results.append({"matched": False})
 
     return jsonify({"status": "ok", "found": True, "results": results})
 
+
+# ATTENDANCE FILTERS ------------------------------------
 @app.route("/attendance_dates")
 @login_required
 def attendance_dates():
     dates = db.session.query(Attendance.date).distinct().all()
     return render_template("attendance_dates.html", dates=dates)
+
 
 @app.route("/attendance_filter/<string:date>", methods=["GET", "POST"])
 @login_required
@@ -313,29 +337,21 @@ def attendance_filter(date):
         branch = request.form.get("branch")
         year = request.form.get("year")
         return redirect(url_for("attendance_list", date=date, branch=branch, year=year))
-
     return render_template("attendance_filter.html", date=date)
+
 
 @app.route("/attendance_list/<string:date>/<string:branch>/<string:year>")
 @login_required
 def attendance_list(date, branch, year):
-    # Convert date string back to Python date
     from datetime import datetime
     selected_date = datetime.strptime(date, "%Y-%m-%d").date()
 
-    # 1. Get present students
     present_students = Attendance.query.filter_by(
-        date=selected_date,
-        branch=branch,
-        year=year
+        date=selected_date, branch=branch, year=year
     ).all()
 
-    # 2. Get all students of that branch+year
     all_students = Student.query.filter_by(branch=branch, year=year).all()
-
-    # 3. Identify ABSENT students
     present_rolls = {p.roll for p in present_students}
-
     absent_students = [s for s in all_students if s.roll not in present_rolls]
 
     return render_template(
@@ -348,14 +364,14 @@ def attendance_list(date, branch, year):
     )
 
 
-# ------------- UTILS -------------
 @app.errorhandler(404)
 def page_not_found(e):
     return render_template('404.html'), 404
 
 
 if __name__ == '__main__':
-    if not os.path.exists('attendance.db'):
+    if not os.path.exists("attendance.db"):
         with app.app_context():
             db.create_all()
+
     app.run(host='0.0.0.0', port=5000, debug=True)
